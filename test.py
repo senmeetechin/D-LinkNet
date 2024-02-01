@@ -1,4 +1,5 @@
 import torch
+torch.cuda.empty_cache()
 import torch.nn as nn
 import torch.utils.data as data
 from torch.autograd import Variable as V
@@ -14,6 +15,12 @@ from time import time
 from networks.unet import Unet
 from networks.dunet import Dunet
 from networks.dinknet import LinkNet34, DinkNet34, DinkNet50, DinkNet101, DinkNet34_less_pool
+
+from joblib import Parallel, delayed
+from glob import glob
+from tqdm import tqdm
+
+import argparse
 
 BATCHSIZE_PER_CARD = 4
 
@@ -34,7 +41,7 @@ class TTAFrame():
             return self.test_one_img_from_path_4(path)
 
     def test_one_img_from_path_8(self, path):
-        img = cv2.imread(path)#.transpose(2,0,1)[None]
+        img = convert_png_image(path)
         img90 = np.array(np.rot90(img))
         img1 = np.concatenate([img[None],img90[None]])
         img2 = np.array(img1)[:,::-1]
@@ -62,7 +69,7 @@ class TTAFrame():
         return mask2
 
     def test_one_img_from_path_4(self, path):
-        img = cv2.imread(path)#.transpose(2,0,1)[None]
+        img = convert_png_image(path)
         img90 = np.array(np.rot90(img))
         img1 = np.concatenate([img[None],img90[None]])
         img2 = np.array(img1)[:,::-1]
@@ -90,7 +97,7 @@ class TTAFrame():
         return mask2
     
     def test_one_img_from_path_2(self, path):
-        img = cv2.imread(path)#.transpose(2,0,1)[None]
+        img = convert_png_image(path)
         img90 = np.array(np.rot90(img))
         img1 = np.concatenate([img[None],img90[None]])
         img2 = np.array(img1)[:,::-1]
@@ -113,8 +120,7 @@ class TTAFrame():
         return mask3
     
     def test_one_img_from_path_1(self, path):
-        img = cv2.imread(path)#.transpose(2,0,1)[None]
-        
+        img = convert_png_image(path)
         img90 = np.array(np.rot90(img))
         img1 = np.concatenate([img[None],img90[None]])
         img2 = np.array(img1)[:,::-1]
@@ -133,20 +139,62 @@ class TTAFrame():
 
     def load(self, path):
         self.net.load_state_dict(torch.load(path))
-        
-#source = 'dataset/test/'
-source = 'dataset/valid/'
-val = os.listdir(source)
-solver = TTAFrame(DinkNet34)
-solver.load('weights/log03_dink34.th')
-tic = time()
-target = 'submits/log03_dink34/'
-os.mkdir(target)
-for i,name in enumerate(val):
-    if i%10 == 0:
-        print(i/10, '    ','%.2f'%(time()-tic))
-    mask = solver.test_one_img_from_path(source+name)
-    mask[mask>4.0] = 255
-    mask[mask<=4.0] = 0
-    mask = np.concatenate([mask[:,:,None],mask[:,:,None],mask[:,:,None]],axis=2)
-    cv2.imwrite(target+name[:-7]+'mask.png',mask.astype(np.uint8))
+
+def convert_png_image(image_path):
+    image = cv2.imread(image_path, cv2.IMREAD_UNCHANGED)
+    image[image[:, :, 3] == 0] = 0
+    image = image[:, :, :3]
+    image = cv2.resize(image, (1024, 1024), interpolation = cv2.INTER_AREA) # interpolation for shrinking image
+    return image
+
+# Check dir path for argparse
+def dir_type(path):
+    if os.path.isdir(path):
+        return path
+    else:
+        raise argparse.ArgumentTypeError(f"readable_dir:{path} is not a valid directory path")
+    
+# Check file path for argparse
+def file_type(path):
+    if os.path.isfile(path):
+        return path
+    else:
+        raise argparse.ArgumentTypeError(f"readable_file:{path} is not a valid file path")
+
+# # Set up model
+# solver = TTAFrame(DinkNet34)
+# solver.load('/home/senmeetechin/work/20231019_road-crack-detection/D-LInkNet/weights/log03_dink34.th')
+
+# # Set up directory
+# folder_dir = '/home/senmeetechin/work/20231019_road-crack-detection/data/Khonkean'
+# source = os.path.join(folder_dir, '10240x10240')
+# target = os.path.join(folder_dir, '10240x10240_mask')
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description="Detect road crack from provided path and save mask as png")
+    parser.add_argument("--img-dir", required=True, type=dir_type, help="Enter input image directory")
+    parser.add_argument("--file-extn", required=True, type=str, help="Enter input image file extension")
+    parser.add_argument("--out-dir", required=True, type=dir_type, help="Enter output directory for saving mask image")
+    parser.add_argument("--weight", required=True, default="./weights/log03_dink34.th", type=file_type, help="Enter location of D-LinkNet weight")
+    parser.add_argument("--n-proc", required=True, default=1, type=int, help="Enter number of processor")
+    opt = parser.parse_args()
+
+    if opt.file_extn.lower().replace('.', '') in ['png', 'jpg', 'jpeg']:
+        opt.file_extn = opt.file_extn.lower().replace('.', '')
+    else:
+        raise Exception(f"{opt.file_extn} cannot use for image file extension")
+    
+    solver = TTAFrame(DinkNet34)
+    solver.load(opt.weight)
+
+    def detect_road(road_path):
+        name = road_path.split('/')[-1].split('.')[0]
+        mask = solver.test_one_img_from_path(road_path)
+        mask[mask>4.0] = 255
+        mask[mask<=4.0] = 0
+        mask = np.concatenate([mask[:,:,None],mask[:,:,None],mask[:,:,None]],axis=2)
+        cv2.imwrite(os.path.join(opt.out_dir, name+'_mask.png'), mask.astype(np.uint8))
+
+    image_path = glob(os.path.join(opt.img_dir, '*.png'))
+
+    Parallel(n_jobs=opt.n_proc)(delayed(detect_road)(path) for path in tqdm(image_path))
